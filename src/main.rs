@@ -22,15 +22,36 @@ fn main() {
         return;
     }
 
-    // No args: ensure installed location and scheduled tasks
-    match ensure_scheduled_tasks() {
-        Ok((created, installed_path)) => {
+    // No args: ensure installed location; then ensure admin for scheduled tasks
+    let installed_exe = match ensure_installed_exe() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("Failed to prepare install location: {}", e);
+            std::process::exit(1);
+        }
+    };
+
+    if !is_running_as_admin() {
+        match try_elevate_to(&installed_exe, &[]) {
+            Ok(()) => {
+                println!("Requesting Administrator approval... If accepted, tasks will be installed by the elevated instance.");
+                return;
+            }
+            Err(e) => {
+                eprintln!("Elevation request failed: {}", e);
+                std::process::exit(1);
+            }
+        }
+    }
+
+    match ensure_scheduled_tasks_for_exe(&installed_exe) {
+        Ok(created) => {
             if created {
                 println!("Installed/updated scheduled tasks (boot and logon).");
             } else {
                 println!("Scheduled tasks already present. Nothing to do.");
             }
-            println!("Executable location: {}", quote_path(&installed_path));
+            println!("Executable location: {}", quote_path(&installed_exe));
             println!(
                 "This tool will: pre-logon set brightness to 100, post-logon restore and exit."
             );
@@ -85,10 +106,8 @@ fn handle_restore() {
     }
 }
 
-fn ensure_scheduled_tasks() -> Result<(bool, PathBuf), String> {
-    // Ensure executable is installed under LocalAppData\Programs and get that path
-    let exe = ensure_installed_exe()?;
-    let exe_quoted = quote_path(&exe);
+fn ensure_scheduled_tasks_for_exe(exe: &Path) -> Result<bool, String> {
+    let exe_quoted = quote_path(exe);
     let startup_task = "WindowsHelloNightHelper_Startup";
     let restore_task = "WindowsHelloNightHelper_Restore";
 
@@ -109,7 +128,7 @@ fn ensure_scheduled_tasks() -> Result<(bool, PathBuf), String> {
         created_any = true;
     }
 
-    Ok((created_any, exe))
+    Ok(created_any)
 }
 
 fn task_exists(name: &str) -> bool {
@@ -199,11 +218,41 @@ fn ensure_installed_exe() -> Result<PathBuf, String> {
     Ok(target)
 }
 
-fn current_exe_display() -> String {
-    match current_exe_path() {
-        Ok(p) => quote_path(&p),
-        Err(_) => "<unknown>".to_string(),
+fn is_running_as_admin() -> bool {
+    let ps = "$p = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent()); if ($p.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { exit 0 } else { exit 1 }";
+    let status = Command::new("powershell")
+        .arg("-NoProfile")
+        .arg("-NonInteractive")
+        .arg("-Command")
+        .arg(ps)
+        .status();
+    match status { Ok(s) => s.success(), Err(_) => false }
+}
+
+fn try_elevate_to(exe: &Path, args: &[&str]) -> Result<(), String> {
+    let file = exe.to_string_lossy();
+    let mut arg_list = String::new();
+    if !args.is_empty() {
+        arg_list = args
+            .iter()
+            .map(|a| format!("'{}'", a.replace("'", "''")))
+            .collect::<Vec<_>>()
+            .join(", ");
     }
+    let ps = if arg_list.is_empty() {
+        format!("Start-Process -FilePath '{}' -Verb RunAs", file.replace("'", "''"))
+    } else {
+        format!("Start-Process -FilePath '{}' -ArgumentList {} -Verb RunAs", file.replace("'", "''"), arg_list)
+    };
+
+    let status = Command::new("powershell")
+        .arg("-NoProfile")
+        .arg("-NonInteractive")
+        .arg("-Command")
+        .arg(ps)
+        .status()
+        .map_err(|e| format!("spawn powershell: {}", e))?;
+    if status.success() { Ok(()) } else { Err(format!("UAC prompt rejected or failed (code {:?})", status.code())) }
 }
 
 fn program_data_dir() -> PathBuf {
