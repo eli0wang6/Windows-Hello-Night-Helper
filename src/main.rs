@@ -140,6 +140,11 @@ fn ensure_scheduled_tasks_for_exe(exe: &Path) -> Result<bool, String> {
     // Clean up legacy tasks created by older versions
     let _ = delete_task_if_exists("WindowsHelloNightHelper_Startup");
     let _ = delete_task_if_exists("WindowsHelloNightHelper_Restore");
+    // Clean up current task set to avoid stale malformed Command
+    let _ = delete_task_if_exists("WindowsHelloNightHelper_OnBoot");
+    let _ = delete_task_if_exists("WindowsHelloNightHelper_OnLogon");
+    let _ = delete_task_if_exists("WindowsHelloNightHelper_OnLock");
+    let _ = delete_task_if_exists("WindowsHelloNightHelper_OnUnlock");
 
     // Resolve current user SID for per-user triggers (logon/lock/unlock)
     let user_sid = get_current_user_sid().map_err(|e| format!("get user sid: {}", e))?;
@@ -159,7 +164,7 @@ fn ensure_scheduled_tasks_for_exe(exe: &Path) -> Result<bool, String> {
 
     match ensure_task_xml(
         "WindowsHelloNightHelper_OnLogon",
-        &render_task_xml_user(exe, "--restore", &logon_trigger_xml(), "Restore brightness at user logon", &user_sid),
+        &render_task_xml_system(exe, "--restore", &logon_trigger_xml(), "Restore brightness at user logon"),
     ) {
         Ok(c) => { created_any |= c; }
         Err(e) => {
@@ -172,21 +177,45 @@ fn ensure_scheduled_tasks_for_exe(exe: &Path) -> Result<bool, String> {
 
     match ensure_task_xml(
         "WindowsHelloNightHelper_OnLock",
-        &render_task_xml_user(exe, "--startup", &session_lock_trigger_xml(), "Set brightness to 100 on workstation lock", &user_sid),
+        &render_task_xml_user(exe, "--startup", &session_lock_trigger_xml_with_user(&user_sid), "Set brightness to 100 on workstation lock", &user_sid),
     ) {
         Ok(c) => { created_any |= c; }
         Err(e) => {
-            eprintln!("XML create for OnLock failed: {}. Skipping lock trigger.", e);
+            eprintln!("XML create for OnLock (user) failed: {}. Retrying as SYSTEM any-user XML...", e);
+            match ensure_task_xml(
+                "WindowsHelloNightHelper_OnLock",
+                &render_task_xml_system(exe, "--startup", &session_lock_trigger_xml_any(), "Set brightness to 100 on workstation lock (any user)"),
+            ) {
+                Ok(c2) => { created_any |= c2; }
+                Err(e2) => {
+                    eprintln!("XML create for OnLock (SYSTEM any-user) failed: {}. Falling back to ONEVENT...", e2);
+                    create_task_onevent_cli_system("WindowsHelloNightHelper_OnLock", 4800, exe, "--startup")
+                        .map_err(|e3| format!("fallback ONEVENT lock failed: {}", e3))?;
+                    created_any = true;
+                }
+            }
         }
     }
 
     match ensure_task_xml(
         "WindowsHelloNightHelper_OnUnlock",
-        &render_task_xml_user(exe, "--restore", &session_unlock_trigger_xml(), "Restore brightness on workstation unlock", &user_sid),
+        &render_task_xml_user(exe, "--restore", &session_unlock_trigger_xml_with_user(&user_sid), "Restore brightness on workstation unlock", &user_sid),
     ) {
         Ok(c) => { created_any |= c; }
         Err(e) => {
-            eprintln!("XML create for OnUnlock failed: {}. Skipping unlock trigger.", e);
+            eprintln!("XML create for OnUnlock (user) failed: {}. Retrying as SYSTEM any-user XML...", e);
+            match ensure_task_xml(
+                "WindowsHelloNightHelper_OnUnlock",
+                &render_task_xml_system(exe, "--restore", &session_unlock_trigger_xml_any(), "Restore brightness on workstation unlock (any user)"),
+            ) {
+                Ok(c2) => { created_any |= c2; }
+                Err(e2) => {
+                    eprintln!("XML create for OnUnlock (SYSTEM any-user) failed: {}. Falling back to ONEVENT...", e2);
+                    create_task_onevent_cli_system("WindowsHelloNightHelper_OnUnlock", 4801, exe, "--restore")
+                        .map_err(|e3| format!("fallback ONEVENT unlock failed: {}", e3))?;
+                    created_any = true;
+                }
+            }
         }
     }
 
@@ -242,31 +271,33 @@ fn ensure_task_xml(name: &str, xml: &str) -> Result<bool, String> {
 }
 
 fn create_task_onstart_cli_system(task_name: &str, exe: &Path, args: &str) -> Result<(), String> {
-    let tr = format!("{} {}", quote_path(exe), args);
-    let output = Command::new("schtasks")
-        .arg("/Create").arg("/F")
-        .arg("/TN").arg(task_name)
-        .arg("/SC").arg("ONSTART")
-        .arg("/RU").arg("SYSTEM")
-        .arg("/RL").arg("HIGHEST")
-        .arg("/TR").arg(tr)
-        .output()
-        .map_err(|e| format!("spawn schtasks: {}", e))?;
-    if output.status.success() { Ok(()) } else { Err(format!("schtasks ONSTART failed: {}", String::from_utf8_lossy(&output.stderr).trim())) }
+    // Recreate via XML to ensure proper Command/Arguments splitting and avoid path truncation
+    let xml = render_task_xml_system(exe, args, &boot_trigger_xml(), "Set brightness to 100 at system startup");
+    ensure_task_xml(task_name, &xml).map(|_| ())
 }
 
 fn create_task_onlogon_cli_system(task_name: &str, exe: &Path, args: &str) -> Result<(), String> {
+    // Recreate via XML to ensure proper Command/Arguments splitting and avoid path truncation
+    let xml = render_task_xml_system(exe, args, &logon_trigger_xml(), "Restore brightness at user logon");
+    ensure_task_xml(task_name, &xml).map(|_| ())
+}
+
+fn create_task_onevent_cli_system(task_name: &str, event_id: u32, exe: &Path, args: &str) -> Result<(), String> {
     let tr = format!("{} {}", quote_path(exe), args);
+    // Event filter: Security log, Event ID 4800 (lock) or 4801 (unlock)
+    let query = format!("*[System[Provider[@Name='Microsoft-Windows-Security-Auditing'] and (EventID={})]]", event_id);
     let output = Command::new("schtasks")
         .arg("/Create").arg("/F")
         .arg("/TN").arg(task_name)
-        .arg("/SC").arg("ONLOGON")
+        .arg("/SC").arg("ONEVENT")
+        .arg("/EC").arg("Security")
+        .arg("/MO").arg(query)
         .arg("/RU").arg("SYSTEM")
         .arg("/RL").arg("HIGHEST")
         .arg("/TR").arg(tr)
         .output()
         .map_err(|e| format!("spawn schtasks: {}", e))?;
-    if output.status.success() { Ok(()) } else { Err(format!("schtasks ONLOGON failed: {}", String::from_utf8_lossy(&output.stderr).trim())) }
+    if output.status.success() { Ok(()) } else { Err(format!("schtasks ONEVENT failed: {}", String::from_utf8_lossy(&output.stderr).trim())) }
 }
 
 fn current_exe_path() -> std::io::Result<PathBuf> {
@@ -327,6 +358,24 @@ fn write_utf16le_file(path: &Path, content: &str) -> std::io::Result<()> {
     f.write_all(&buf)
 }
 
+fn ensure_system_copy_exe(user_exe: &Path) -> Result<PathBuf, String> {
+    // Copy executable to a path without spaces to avoid Task Scheduler truncation in XML
+    let system_dir = PathBuf::from(r"C:\ProgramData\WindowsHelloNightHelper");
+    if !system_dir.exists() {
+        fs::create_dir_all(&system_dir).map_err(|e| format!("mkdir {:?}: {}", system_dir, e))?;
+    }
+    let target = system_dir.join("whnh.exe");
+    // If same content size and modified time newer, skip copy best-effort; otherwise copy
+    let need_copy = match (fs::metadata(&target), fs::metadata(user_exe)) {
+        (Ok(a), Ok(b)) => a.len() != b.len(),
+        _ => true,
+    };
+    if need_copy {
+        fs::copy(user_exe, &target).map_err(|e| format!("copy {:?} -> {:?} failed: {}", user_exe, target, e))?;
+    }
+    Ok(target)
+}
+
 fn is_running_as_admin() -> bool {
     let ps = "$p = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent()); if ($p.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { exit 0 } else { exit 1 }";
     let status = Command::new("powershell")
@@ -340,18 +389,18 @@ fn is_running_as_admin() -> bool {
 
 fn try_elevate_to(exe: &Path, args: &[&str]) -> Result<(), String> {
     let file = exe.to_string_lossy();
-    let mut arg_list = String::new();
-    if !args.is_empty() {
-        arg_list = args
+    let escaped_file = file.replace("\"", "`\"");
+    let arg_items = if args.is_empty() { String::new() } else {
+        args
             .iter()
-            .map(|a| format!("'{}'", a.replace("'", "''")))
+            .map(|a| format!("\"{}\"", a.replace("\"", "`\"")))
             .collect::<Vec<_>>()
-            .join(", ");
-    }
-    let ps = if arg_list.is_empty() {
-        format!("Start-Process -FilePath '{}' -Verb RunAs -WindowStyle Hidden -Wait", file.replace("'", "''"))
+            .join(",")
+    };
+    let ps = if arg_items.is_empty() {
+        format!("Start-Process -FilePath \"{}\" -Verb RunAs -WindowStyle Hidden -Wait", escaped_file)
     } else {
-        format!("Start-Process -FilePath '{}' -ArgumentList {} -Verb RunAs -WindowStyle Hidden -Wait", file.replace("'", "''"), arg_list)
+        format!("Start-Process -FilePath \"{}\" -ArgumentList @({}) -Verb RunAs -WindowStyle Hidden -Wait", escaped_file, arg_items)
     };
 
     let status = Command::new("powershell")
@@ -505,6 +554,44 @@ fn render_task_xml_system(exe: &Path, args: &str, trigger_xml: &str, description
     render_task_xml_with_prefix(base_task_xml_prefix_system(description), exe, args, trigger_xml)
 }
 
+fn render_task_xml_system_cmd_wrapper(exe: &Path, args: &str, trigger_xml: &str, description: &str) -> String {
+    // Wrap in cmd.exe to avoid Task Scheduler UI truncating quoted paths. We pass full command via /c.
+    let cmd = sanitize_path_display(Path::new("C:\\Windows\\System32\\cmd.exe"));
+    let full = format!("\"{}\" {}", task_command_path_string(exe), args);
+    let wrapped_args = format!("/c {}", full);
+    let mut xml = String::new();
+    xml.push_str(&base_task_xml_prefix_system(description));
+    xml.push_str("<Triggers>");
+    xml.push_str(trigger_xml);
+    xml.push_str("</Triggers>");
+    xml.push_str("<Actions Context=\"Author\"><Exec>");
+    xml.push_str(&format!("<Command>{}</Command>", xml_escape_text(&cmd)));
+    xml.push_str(&format!("<Arguments>{}</Arguments>", xml_escape_text(&wrapped_args)));
+    xml.push_str("</Exec></Actions></Task>");
+    xml
+}
+
+fn render_task_xml_system_ps_wrapper(exe: &Path, args: &str, trigger_xml: &str, description: &str) -> String {
+    // Use PowerShell -File to run exe with arguments via a small inline script, robust with spaces in username
+    let ps = sanitize_path_display(Path::new("C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe"));
+    let exe_path = task_command_path_string(exe).replace("\"", "`");
+    let arg_text = args.replace("\"", "`");
+    // Compose: powershell -NoProfile -NonInteractive -Command & 'C:\path\exe' --startup
+    // Prefer -Command with call operator to avoid argument parsing issues
+    let ps_args = format!("-NoProfile -NonInteractive -Command & '%1' %2");
+    // We'll substitute %1 with exe_path and %2 with arg_text via -ArgumentList
+    let mut xml = String::new();
+    xml.push_str(&base_task_xml_prefix_system(description));
+    xml.push_str("<Triggers>");
+    xml.push_str(trigger_xml);
+    xml.push_str("</Triggers>");
+    xml.push_str("<Actions Context=\"Author\"><Exec>");
+    xml.push_str(&format!("<Command>{}</Command>", xml_escape_text(&ps)));
+    xml.push_str(&format!("<Arguments>{}</Arguments>", xml_escape_text(&ps_args.replace("%1", &exe_path).replace("%2", &arg_text))));
+    xml.push_str("</Exec></Actions></Task>");
+    xml
+}
+
 fn render_task_xml_user(exe: &Path, args: &str, trigger_xml: &str, description: &str, user_sid: &str) -> String {
     render_task_xml_with_prefix(base_task_xml_prefix_user(description, user_sid), exe, args, trigger_xml)
 }
@@ -516,16 +603,71 @@ fn render_task_xml_with_prefix(prefix: String, exe: &Path, args: &str, trigger_x
     xml.push_str(trigger_xml);
     xml.push_str("</Triggers>");
     xml.push_str("<Actions Context=\"Author\"><Exec>");
-    xml.push_str(&format!("<Command>{}</Command>", exe.to_string_lossy()));
-    if !args.is_empty() { xml.push_str(&format!("<Arguments>{}</Arguments>", args)); }
+    // Use full long path (matching Lock/Unlock). Do not strip quotes here; XML escaping will handle it.
+    let cmd = task_command_path_string(exe);
+    xml.push_str(&format!("<Command>{}</Command>", xml_escape_text(&cmd)));
+    if !args.is_empty() { xml.push_str(&format!("<Arguments>{}</Arguments>", xml_escape_text(args))); }
+    // Avoid setting WorkingDirectory to prevent Task Scheduler UI from prefixing drive like "D:\" before quoted paths
     xml.push_str("</Exec></Actions></Task>");
     xml
 }
 
+fn task_command_path_string(exe: &Path) -> String {
+    let abs = if exe.is_absolute() { exe.to_path_buf() } else { exe.canonicalize().unwrap_or_else(|_| exe.to_path_buf()) };
+    sanitize_path_display(&abs)
+}
+
+fn sanitize_path_display(p: &Path) -> String {
+    let mut s = p.to_string_lossy().to_string();
+    if s.starts_with("\\\\?\\") { s = s.trim_start_matches("\\\\?\\").to_string(); }
+    s
+}
+
+fn xml_escape_text(input: &str) -> String {
+    input
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace("\"", "&quot;")
+        .replace("'", "&apos;")
+}
+
+fn try_get_short_path(p: &Path) -> Option<String> {
+    // Use PowerShell COM Scripting.FileSystemObject to get ShortPath reliably
+    let mut path_str = p.to_string_lossy().to_string();
+    if path_str.starts_with("\\\\?\\") { path_str = path_str.trim_start_matches("\\\\?\\").to_string(); }
+    let escaped = path_str.replace("'", "''");
+    let ps = format!(
+        "$p='{}'; $fs=New-Object -ComObject Scripting.FileSystemObject; if ($fs.FileExists($p)) {{ ($fs.GetFile($p)).ShortPath }} elseif ($fs.FolderExists($p)) {{ ($fs.GetFolder($p)).ShortPath }}",
+        escaped
+    );
+    let output = Command::new("powershell")
+        .arg("-NoProfile")
+        .arg("-NonInteractive")
+        .arg("-Command")
+        .arg(ps)
+        .output()
+        .ok()?;
+    if !output.status.success() { return None; }
+    let s = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if s.is_empty() || s.contains('*') || s.contains('"') { None } else { Some(s) }
+}
+
 fn boot_trigger_xml() -> String { "<BootTrigger><Enabled>true</Enabled></BootTrigger>".to_string() }
 fn logon_trigger_xml() -> String { "<LogonTrigger><Enabled>true</Enabled></LogonTrigger>".to_string() }
-fn session_lock_trigger_xml() -> String { "<SessionStateChangeTrigger><Enabled>true</Enabled><State>SessionLock</State></SessionStateChangeTrigger>".to_string() }
-fn session_unlock_trigger_xml() -> String { "<SessionStateChangeTrigger><Enabled>true</Enabled><State>SessionUnlock</State></SessionStateChangeTrigger>".to_string() }
+fn session_lock_trigger_xml_with_user(user_sid: &str) -> String {
+    format!("<SessionStateChangeTrigger><Enabled>true</Enabled><UserId>{}</UserId><State>SessionLock</State></SessionStateChangeTrigger>", user_sid)
+}
+fn session_unlock_trigger_xml_with_user(user_sid: &str) -> String {
+    format!("<SessionStateChangeTrigger><Enabled>true</Enabled><UserId>{}</UserId><State>SessionUnlock</State></SessionStateChangeTrigger>", user_sid)
+}
+
+fn session_lock_trigger_xml_any() -> String {
+    "<SessionStateChangeTrigger><Enabled>true</Enabled><State>SessionLock</State></SessionStateChangeTrigger>".to_string()
+}
+fn session_unlock_trigger_xml_any() -> String {
+    "<SessionStateChangeTrigger><Enabled>true</Enabled><State>SessionUnlock</State></SessionStateChangeTrigger>".to_string()
+}
 
 fn get_current_user_sid() -> Result<String, String> {
     let ps = "[System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value";
